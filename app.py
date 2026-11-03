@@ -2,11 +2,14 @@
 import json
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import urlparse
 
 import pandas as pd
 import requests
 import streamlit as st
 import yfinance as yf
+from bs4 import BeautifulSoup
 
 st.set_page_config(page_title="StockScope", page_icon="📊", layout="centered")
 
@@ -135,9 +138,65 @@ def gemini(prompt, search=False):
                        "Wait a minute, or try again later (daily limits reset overnight). Details: " + last)
 
 
-RESEARCH_PROMPT = """Research the listed company: "{q}". It is probably listed on the Nairobi Securities Exchange (NSE), Kenya, but if not, find the right exchange.
-Use Google Search. Prefer official sources first (NSE, the company's investor/results pages, CBK for banks), then Kenyan business media (Business Daily, Nation, The Star, Mansa, AfricanFinancials, Kenyan Wall Street).
-Find the LATEST figures. Return ONLY one JSON object, no other text, with these keys:
+PREFERRED = ("nse.co.ke", "africanfinancials", "businessdailyafrica", "kenyanwallstreet", "mansa", "nation.africa",
+             "the-star.co.ke", "standardmedia", "centralbank.go.ke", "marketscreener", "stockanalysis", "investing.com")
+BLOCKED = ("youtube", "facebook", "twitter", "x.com", "instagram", "tiktok", "linkedin", "reddit", "pinterest")
+
+
+def domain(url):
+    return urlparse(url).netloc.replace("www.", "")
+
+
+def web_search(query, n=8):
+    try:
+        from ddgs import DDGS
+    except ImportError:
+        from duckduckgo_search import DDGS
+    return list(DDGS().text(query, max_results=n))
+
+
+def gather(q):
+    queries = [f"{q} Kenya NSE share price",
+               f"{q} latest annual results net profit EPS dividend per share",
+               f"{q} non-performing loans net interest margin cost to income ratio"]
+    seen, hits = set(), []
+    for s in queries:
+        try:
+            results = web_search(s)
+        except Exception:
+            continue
+        for r in results:
+            url = r.get("href") or r.get("url")
+            if not url or url in seen:
+                continue
+            dom = domain(url)
+            if any(b in dom for b in BLOCKED):
+                continue
+            seen.add(url)
+            hits.append({"url": url, "title": r.get("title", ""), "snippet": r.get("body", ""), "dom": dom})
+    if not hits:
+        raise RuntimeError("Web search returned nothing (it may be temporarily blocked). "
+                           "Wait a few minutes, or choose 'Enter numbers myself'.")
+    hits.sort(key=lambda h: 0 if any(p in h["dom"] for p in PREFERRED) else 1)
+    return hits[:10]
+
+
+def fetch_text(h):
+    try:
+        r = requests.get(h["url"], headers={"User-Agent": "Mozilla/5.0 (compatible; StockScope/1.0)"}, timeout=12)
+        if r.status_code != 200 or "html" not in r.headers.get("content-type", ""):
+            return h["snippet"]
+        soup = BeautifulSoup(r.text, "html.parser")
+        for t in soup(["script", "style", "nav", "footer", "header", "aside", "form"]):
+            t.decompose()
+        text = " ".join(soup.get_text(" ", strip=True).split())
+        return (h["snippet"] + " | " + text)[:5000]
+    except Exception:
+        return h["snippet"]
+
+
+EXTRACT_PROMPT = """Below are excerpts from web pages about the listed company "{q}" (probably on the Nairobi Securities Exchange, Kenya).
+Extract the LATEST figures and return ONLY one JSON object, no other text, with these keys:
 name, ticker, sector, is_bank (true/false), currency,
 price, price_date,
 eps (latest full-year or trailing-12-month earnings per share),
@@ -146,13 +205,20 @@ net_profit, net_profit_prior (same period type, previous year, same units),
 revenue, revenue_prior (banks: total operating income; same units),
 total_equity (same units as net_profit), roe_pct, debt_to_equity (ratio, null for banks), market_cap_bn (billions),
 npl_ratio_pct, nim_pct, cost_income_pct, capital_ratio_pct (banks only, else null),
-results_period (e.g. "FY2025" or "H1 2026"), notes (one short sentence on data quality or conflicts).
-Rules: numbers only (no text or commas) for numeric keys. Use null when you cannot find or verify a value. Never guess or invent. If sources disagree, pick the most official one and mention it in notes."""
+results_period (e.g. "FY2025" or "H1 2026"), notes (one short sentence on data quality, conflicts or gaps).
+Rules: use ONLY the excerpts below. Numbers only (no text or commas) for numeric keys. Use null when a value is not clearly stated. Never guess, never use memory. If excerpts disagree, prefer official sources (NSE, company, CBK) and mention it in notes.
+
+EXCERPTS:
+{corpus}"""
 
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
 def research(query):
-    text, sources = gemini(RESEARCH_PROMPT.format(q=query), search=True)
+    hits = gather(query)
+    with ThreadPoolExecutor(6) as ex:
+        texts = list(ex.map(fetch_text, hits))
+    corpus = "\n\n".join(f"[SOURCE {i + 1}] {h['url']}\n{t}" for i, (h, t) in enumerate(zip(hits, texts)))
+    text, _ = gemini(EXTRACT_PROMPT.format(q=query, corpus=corpus))
     m = re.search(r"\{.*\}", text, re.S)
     if not m:
         raise RuntimeError("Could not read the research result. Try the full company name.")
@@ -160,6 +226,7 @@ def research(query):
         data = json.loads(m.group(0))
     except Exception:
         raise RuntimeError("The research result was garbled. Please try again.")
+    sources = [{"title": h["dom"], "url": h["url"]} for h in hits]
     return data, sources
 
 
@@ -354,12 +421,12 @@ st.title("📊 StockScope")
 st.caption("Type a company. It researches the web, runs the checks big investors use, and explains the result.")
 st.warning(DISCLAIMER)
 
-mode = st.radio("Source", ["Web research (best for Kenya)", "Yahoo ticker (international)"])
-q = st.text_input("Company or ticker", placeholder="Diamond Trust Bank, Safaricom, KCB..." if mode.startswith("Web") else "AAPL, BP.L")
+mode = st.radio("Source", ["Web research (best for Kenya)", "Yahoo ticker (international)", "Enter numbers myself"])
+q = st.text_input("Company or ticker", placeholder="Diamond Trust Bank, Safaricom, KCB..." if not mode.startswith("Yahoo") else "AAPL, BP.L")
 
 if st.button("Analyse", type="primary") and q.strip():
     try:
-        with st.spinner("Researching... this can take up to a minute"):
+        with st.spinner("Searching and reading sources... up to a minute"):
             if mode.startswith("Web"):
                 data, sources = research(q.strip())
                 facts = {k: num(data.get(k)) for k, _ in NUM_FIELDS}
@@ -367,8 +434,12 @@ if st.button("Analyse", type="primary") and q.strip():
                         "is_bank": bool(data.get("is_bank")), "currency": data.get("currency") or "KES",
                         "period": data.get("results_period"), "notes": data.get("notes") or "",
                         "price_date": data.get("price_date"), "sources": sources}
-            else:
+            elif mode.startswith("Yahoo"):
                 facts, meta = facts_from_yahoo(q.strip())
+            else:
+                facts = {k: None for k, _ in NUM_FIELDS}
+                meta = {"name": q.strip(), "ticker": "", "sector": "", "is_bank": False, "currency": "KES",
+                        "period": "entered by you", "notes": "", "sources": [], "manual": True}
         st.session_state.facts, st.session_state.meta = facts, meta
         st.session_state.rid = st.session_state.get("rid", 0) + 1
         st.session_state.pop("ai", None)
@@ -379,7 +450,7 @@ if st.button("Analyse", type="primary") and q.strip():
 if "facts" in st.session_state:
     facts, meta, rid = st.session_state.facts, st.session_state.meta, st.session_state.rid
 
-    with st.expander("✏️ Check and edit the numbers"):
+    with st.expander("✏️ Check and edit the numbers", expanded=bool(meta.get("manual"))):
         st.caption("If a figure is wrong or missing, fix it from the NSE or the company's results. Everything below updates.")
         vals = {}
         for k, label in NUM_FIELDS:
