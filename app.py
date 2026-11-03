@@ -1,7 +1,9 @@
 """StockScope v2 - Kenya-first web research. Research support, not financial advice."""
+import datetime
 import json
 import os
 import re
+from io import BytesIO
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse
 
@@ -141,6 +143,20 @@ def gemini(prompt, search=False):
 PREFERRED = ("nse.co.ke", "africanfinancials", "businessdailyafrica", "kenyanwallstreet", "mansa", "nation.africa",
              "the-star.co.ke", "standardmedia", "centralbank.go.ke", "marketscreener", "stockanalysis", "investing.com")
 BLOCKED = ("youtube", "facebook", "twitter", "x.com", "instagram", "tiktok", "linkedin", "reddit", "pinterest")
+UA = {"User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Mobile Safari/537.36"}
+
+TERMS = {
+    "price": "share price NSE", "eps": "earnings per share", "book_value_ps": "book value per share net asset value per share",
+    "dividend_ps": "dividend per share", "net_profit": "profit after tax net profit", "net_profit_prior": "profit after tax previous year",
+    "total_equity": "total shareholders equity", "npl_ratio_pct": "NPL ratio non-performing loans",
+    "nim_pct": "net interest margin", "cost_income_pct": "cost to income ratio", "capital_ratio_pct": "total capital ratio capital adequacy",
+}
+BANK_ONLY = ("npl_ratio_pct", "nim_pct", "cost_income_pct", "capital_ratio_pct")
+KEY_RE = re.compile(
+    r"(net profit|profit after tax|profit for the (?:year|period)|earnings per share|\bEPS\b|dividend|book value|net asset value|"
+    r"\bNAV\b|\bNPL|non[- ]performing|net interest margin|\bNIM\b|cost[- ]to[- ]income|capital adequacy|core capital|total capital|"
+    r"shareholders.{0,3} (?:funds|equity)|total equity|total (?:operating )?income|share price|market cap|price[- ]to[- ]book|"
+    r"return on (?:average )?equity|\bROE\b)", re.I)
 
 
 def domain(url):
@@ -155,11 +171,8 @@ def web_search(query, n=8):
     return list(DDGS().text(query, max_results=n))
 
 
-def gather(q):
-    queries = [f"{q} Kenya NSE share price",
-               f"{q} latest annual results net profit EPS dividend per share",
-               f"{q} non-performing loans net interest margin cost to income ratio"]
-    seen, hits = set(), []
+def gather(queries, exclude, limit, strict=True):
+    seen, hits = set(exclude), []
     for s in queries:
         try:
             results = web_search(s)
@@ -174,25 +187,87 @@ def gather(q):
                 continue
             seen.add(url)
             hits.append({"url": url, "title": r.get("title", ""), "snippet": r.get("body", ""), "dom": dom})
-    if not hits:
+    if not hits and strict:
         raise RuntimeError("Web search returned nothing (it may be temporarily blocked). "
                            "Wait a few minutes, or choose 'Enter numbers myself'.")
     hits.sort(key=lambda h: 0 if any(p in h["dom"] for p in PREFERRED) else 1)
-    return hits[:10]
+    return hits[:limit]
+
+
+def relevant(text, limit=7000, pad=350):
+    """Keep only the parts of a long page around financial keywords."""
+    spans = []
+    for m in KEY_RE.finditer(text):
+        a, b = max(0, m.start() - pad), min(len(text), m.end() + pad)
+        if spans and a <= spans[-1][1]:
+            spans[-1][1] = max(spans[-1][1], b)
+        else:
+            spans.append([a, b])
+    if not spans:
+        return text[: limit // 3]
+    return " ... ".join(text[a:b] for a, b in spans)[:limit]
+
+
+def download(url, limit=10_000_000):
+    r = requests.get(url, headers=UA, timeout=20, stream=True)
+    ctype = r.headers.get("content-type", "").lower()
+    body = b""
+    if r.status_code == 200:
+        for chunk in r.iter_content(65536):
+            body += chunk
+            if len(body) > limit:
+                break
+    r.close()
+    return ctype, body
+
+
+def pdf_text(body):
+    try:
+        from pypdf import PdfReader
+        pages = PdfReader(BytesIO(body)).pages[:40]
+        return " ".join((p.extract_text() or "") for p in pages)
+    except Exception:
+        return ""
+
+
+def html_text(body):
+    soup = BeautifulSoup(body.decode("utf-8", "ignore"), "html.parser")
+    for t in soup(["script", "style", "nav", "footer", "header", "aside", "form"]):
+        t.decompose()
+    return " ".join(soup.get_text(" ", strip=True).split())
+
+
+def jina_text(url):
+    """Free reader service that handles JavaScript pages and PDFs."""
+    try:
+        r = requests.get("https://r.jina.ai/" + url, headers={"Accept": "text/plain"}, timeout=40)
+        return r.text if r.status_code == 200 else ""
+    except Exception:
+        return ""
 
 
 def fetch_text(h):
+    url, snip = h["url"], h["snippet"]
     try:
-        r = requests.get(h["url"], headers={"User-Agent": "Mozilla/5.0 (compatible; StockScope/1.0)"}, timeout=12)
-        if r.status_code != 200 or "html" not in r.headers.get("content-type", ""):
-            return h["snippet"]
-        soup = BeautifulSoup(r.text, "html.parser")
-        for t in soup(["script", "style", "nav", "footer", "header", "aside", "form"]):
-            t.decompose()
-        text = " ".join(soup.get_text(" ", strip=True).split())
-        return (h["snippet"] + " | " + text)[:5000]
+        ctype, body = download(url)
+        text = ""
+        if body:
+            if "pdf" in ctype or url.lower().split("?")[0].endswith(".pdf"):
+                text = pdf_text(body)
+            elif "html" in ctype:
+                text = html_text(body)
+        if len(text) < 1500:
+            alt = jina_text(url)
+            if len(alt) > len(text):
+                text = alt
+        return (snip + " | " + relevant(text)) if text else snip
     except Exception:
-        return h["snippet"]
+        return snip
+
+
+def fetch_all(hits):
+    with ThreadPoolExecutor(6) as ex:
+        return list(ex.map(fetch_text, hits))
 
 
 EXTRACT_PROMPT = """Below are excerpts from web pages about the listed company "{q}" (probably on the Nairobi Securities Exchange, Kenya).
@@ -206,28 +281,56 @@ revenue, revenue_prior (banks: total operating income; same units),
 total_equity (same units as net_profit), roe_pct, debt_to_equity (ratio, null for banks), market_cap_bn (billions),
 npl_ratio_pct, nim_pct, cost_income_pct, capital_ratio_pct (banks only, else null),
 results_period (e.g. "FY2025" or "H1 2026"), notes (one short sentence on data quality, conflicts or gaps).
-Rules: use ONLY the excerpts below. Numbers only (no text or commas) for numeric keys. Use null when a value is not clearly stated. Never guess, never use memory. If excerpts disagree, prefer official sources (NSE, company, CBK) and mention it in notes.
+Rules: use ONLY the excerpts below. Numbers only (no text or commas) for numeric keys. Use null when a value is not clearly stated. Never guess, never use memory. Tables may be flattened into text, so read rows and columns carefully, and make sure net_profit and net_profit_prior come from the same table in the same units. If excerpts disagree, prefer official sources (NSE, company, CBK) and mention it in notes.
+ALREADY KNOWN (keep unless the excerpts clearly show a better figure, and fill the nulls): {known}
 
 EXCERPTS:
 {corpus}"""
 
 
-@st.cache_data(ttl=6 * 3600, show_spinner=False)
-def research(query):
-    hits = gather(query)
-    with ThreadPoolExecutor(6) as ex:
-        texts = list(ex.map(fetch_text, hits))
-    corpus = "\n\n".join(f"[SOURCE {i + 1}] {h['url']}\n{t}" for i, (h, t) in enumerate(zip(hits, texts)))
-    text, _ = gemini(EXTRACT_PROMPT.format(q=query, corpus=corpus))
+def parse_json(text):
     m = re.search(r"\{.*\}", text, re.S)
     if not m:
         raise RuntimeError("Could not read the research result. Try the full company name.")
     try:
-        data = json.loads(m.group(0))
+        return json.loads(m.group(0))
     except Exception:
         raise RuntimeError("The research result was garbled. Please try again.")
-    sources = [{"title": h["dom"], "url": h["url"]} for h in hits]
-    return data, sources
+
+
+def extract(q, hits, texts, known=None):
+    corpus = "\n\n".join(f"[SOURCE {i + 1}] {h['url']}\n{t}" for i, (h, t) in enumerate(zip(hits, texts)))
+    prompt = EXTRACT_PROMPT.format(q=q, corpus=corpus[:90000], known=json.dumps(known) if known else "nothing yet")
+    return parse_json(gemini(prompt)[0])
+
+
+def missing_fields(data):
+    need = [k for k in TERMS if bool(data.get("is_bank")) or k not in BANK_ONLY]
+    return [k for k in need if num(data.get(k)) is None]
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def research(query):
+    year = datetime.date.today().year
+    round1 = [f"{query} Kenya NSE share price",
+              f"{query} {year - 1} annual results net profit EPS dividend per share",
+              f"{query} financial results press release net profit total income",
+              f"{query} book value per share price to book",
+              f"{query} site:africanfinancials.com",
+              f"{query} non-performing loans net interest margin cost to income ratio"]
+    hits = gather(round1, set(), 12)
+    data = extract(query, hits, fetch_all(hits))
+    all_hits = list(hits)
+    missing = missing_fields(data)
+    if missing:  # second, targeted round for whatever is still empty
+        name = data.get("name") or query
+        round2 = [f"{name} {TERMS[k]} {year - 1} {year}" for k in missing[:5]]
+        more = gather(round2, {h["url"] for h in hits}, 8, strict=False)
+        if more:
+            new = extract(query, more, fetch_all(more), known=data)
+            data = {**data, **{k: v for k, v in new.items() if v is not None}}
+            all_hits += more
+    return data, [{"title": h["dom"], "url": h["url"]} for h in all_hits]
 
 
 def facts_from_yahoo(ticker):
@@ -424,18 +527,33 @@ st.warning(DISCLAIMER)
 mode = st.radio("Source", ["Web research (best for Kenya)", "Yahoo ticker (international)", "Enter numbers myself"])
 q = st.text_input("Company or ticker", placeholder="Diamond Trust Bank, Safaricom, KCB..." if not mode.startswith("Yahoo") else "AAPL, BP.L")
 
+def meta_from(data, q, sources):
+    return {"name": data.get("name") or q, "ticker": data.get("ticker"), "sector": data.get("sector"),
+            "is_bank": bool(data.get("is_bank")), "currency": data.get("currency") or "KES",
+            "period": data.get("results_period"), "notes": data.get("notes") or "",
+            "price_date": data.get("price_date"), "sources": sources}
+
+
+pasted = ""
+if mode.startswith("Enter"):
+    pasted = st.text_area("Optional: paste text from a results page or announcement",
+                          placeholder="Copy the results text from Google or a PDF and paste it here. The AI reads it for you.",
+                          height=120)
+
 if st.button("Analyse", type="primary") and q.strip():
     try:
-        with st.spinner("Searching and reading sources... up to a minute"):
+        with st.spinner("Searching and reading sources... this can take 1-2 minutes"):
             if mode.startswith("Web"):
                 data, sources = research(q.strip())
                 facts = {k: num(data.get(k)) for k, _ in NUM_FIELDS}
-                meta = {"name": data.get("name") or q, "ticker": data.get("ticker"), "sector": data.get("sector"),
-                        "is_bank": bool(data.get("is_bank")), "currency": data.get("currency") or "KES",
-                        "period": data.get("results_period"), "notes": data.get("notes") or "",
-                        "price_date": data.get("price_date"), "sources": sources}
+                meta = meta_from(data, q.strip(), sources)
             elif mode.startswith("Yahoo"):
                 facts, meta = facts_from_yahoo(q.strip())
+            elif pasted.strip():
+                prompt = EXTRACT_PROMPT.format(q=q.strip(), corpus=relevant(pasted, 60000), known="nothing yet")
+                data = parse_json(gemini(prompt)[0])
+                facts = {k: num(data.get(k)) for k, _ in NUM_FIELDS}
+                meta = meta_from(data, q.strip(), [{"title": "Text you pasted", "url": ""}])
             else:
                 facts = {k: None for k, _ in NUM_FIELDS}
                 meta = {"name": q.strip(), "ticker": "", "sector": "", "is_bank": False, "currency": "KES",
@@ -481,6 +599,12 @@ if "facts" in st.session_state:
     else:
         rows.append(("Debt/Equity", fmt(m["debt_to_equity"])))
     st.dataframe(pd.DataFrame(rows, columns=["Metric", "Value"]), hide_index=True, use_container_width=True)
+
+    gaps = [lbl for k, lbl in NUM_FIELDS if vals.get(k) is None and (m["is_bank"] or k not in BANK_ONLY)
+            and k not in ("revenue", "revenue_prior", "roe_pct", "debt_to_equity", "market_cap_bn")]
+    if gaps:
+        st.info("Not found: " + ", ".join(gaps) + ". Fill them in under 'Check and edit the numbers', "
+                "or paste the results text under 'Enter numbers myself'.")
 
     st.subheader("Red flags")
     if not flags:
