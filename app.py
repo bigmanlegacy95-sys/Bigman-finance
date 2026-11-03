@@ -79,49 +79,60 @@ API = "https://generativelanguage.googleapis.com/v1beta"
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def pick_model(key):
-    """Ask Google which models this key can use, and pick the newest stable Flash."""
+def pick_models(key):
+    """Ask Google which models this key can use. Returns candidates, best first."""
     r = requests.get(f"{API}/models", headers={"x-goog-api-key": key}, params={"pageSize": 200}, timeout=30)
     r.raise_for_status()
     names = [m["name"].split("/")[-1] for m in r.json().get("models", [])
              if "generateContent" in m.get("supportedGenerationMethods", [])]
-    bad = ("lite", "image", "tts", "live", "audio", "exp", "preview", "latest", "embed", "thinking", "robotics")
-    flash = [n for n in names if "flash" in n and not any(b in n for b in bad)]
+    bad = ("image", "tts", "live", "audio", "exp", "preview", "latest", "embed", "thinking", "robotics")
+    stable = [n for n in names if "flash" in n and not any(b in n for b in bad)]
 
     def ver(n):
         mt = re.search(r"gemini-(\d+(?:\.\d+)?)", n)
         return float(mt.group(1)) if mt else 0.0
 
-    pool = sorted(flash, key=ver, reverse=True) or [n for n in names if "flash" in n] or names
+    full = sorted([n for n in stable if "lite" not in n], key=ver, reverse=True)
+    lite = sorted([n for n in stable if "lite" in n], key=ver, reverse=True)
+    pool = (full[:2] + lite[:1]) or [n for n in names if "flash" in n][:3] or names[:3]
     if not pool:
         raise RuntimeError("This API key has no models available. Create a new key at aistudio.google.com.")
-    return pool[0]
+    return pool
 
 
 def gemini(prompt, search=False):
     key = secret("GEMINI_API_KEY")
     if not key:
         raise RuntimeError("No GEMINI_API_KEY found. Add it under the app's Secrets.")
-    model = secret("GEMINI_MODEL") or pick_model(key)
+    forced = secret("GEMINI_MODEL")
+    models = [forced] if forced else pick_models(key)
     body = {"contents": [{"parts": [{"text": prompt}]}]}
     if search:
         body["tools"] = [{"google_search": {}}]
-    r = requests.post(f"{API}/models/{model}:generateContent",
-                      headers={"x-goog-api-key": key}, json=body, timeout=120)
-    if r.status_code == 429:
-        raise RuntimeError("Free AI limit reached. Wait a minute and try again.")
-    if r.status_code >= 400:
-        try:
-            detail = r.json()["error"]["message"][:200]
-        except Exception:
-            detail = ""
-        raise RuntimeError(f"AI service error {r.status_code} (model: {model}). {detail}")
-    cand = r.json()["candidates"][0]
-    text = "".join(p.get("text", "") for p in cand.get("content", {}).get("parts", []))
-    chunks = cand.get("groundingMetadata", {}).get("groundingChunks", [])
-    sources = [{"title": c["web"].get("title", ""), "url": c["web"].get("uri", "")}
-               for c in chunks if "web" in c]
-    return text, sources
+    last = ""
+    for model in models:
+        r = requests.post(f"{API}/models/{model}:generateContent",
+                          headers={"x-goog-api-key": key}, json=body, timeout=120)
+        if r.status_code in (429, 404, 503):
+            try:
+                last = f"{model}: {r.json()['error']['message'][:160]}"
+            except Exception:
+                last = f"{model}: error {r.status_code}"
+            continue
+        if r.status_code >= 400:
+            try:
+                detail = r.json()["error"]["message"][:200]
+            except Exception:
+                detail = ""
+            raise RuntimeError(f"AI service error {r.status_code} (model: {model}). {detail}")
+        cand = r.json()["candidates"][0]
+        text = "".join(p.get("text", "") for p in cand.get("content", {}).get("parts", []))
+        chunks = cand.get("groundingMetadata", {}).get("groundingChunks", [])
+        sources = [{"title": c["web"].get("title", ""), "url": c["web"].get("uri", "")}
+                   for c in chunks if "web" in c]
+        return text, sources
+    raise RuntimeError("All free AI models are busy or out of quota right now. "
+                       "Wait a minute, or try again later (daily limits reset overnight). Details: " + last)
 
 
 RESEARCH_PROMPT = """Research the listed company: "{q}". It is probably listed on the Nairobi Securities Exchange (NSE), Kenya, but if not, find the right exchange.
@@ -362,6 +373,7 @@ if st.button("Analyse", type="primary") and q.strip():
         st.session_state.rid = st.session_state.get("rid", 0) + 1
         st.session_state.pop("ai", None)
     except Exception as e:
+        st.session_state.pop("facts", None)
         st.error(str(e))
 
 if "facts" in st.session_state:
